@@ -11,10 +11,11 @@ os.environ['KIOSK_TOKEN'] = 'test-kiosk'
 from fastapi.testclient import TestClient
 from PIL import Image
 from app import main
-from app.blink import count_blinks
+from app.blink import count_blinks, validate_capture
+import pytest
 
 client = TestClient(main.app)
-admin = {'Authorization': 'Bearer test-admin'}
+admin = {'Authorization': 'Bearer ' + main.issue_admin_session()['token']}
 kiosk = {'Authorization': 'Bearer test-kiosk'}
 
 def test_blinks_require_complete_cycles():
@@ -23,6 +24,16 @@ def test_blinks_require_complete_cycles():
     assert count_blinks([0, .8, 0]) == 1
     assert count_blinks([0, .8]) == 0
     assert count_blinks([0, 0, 0]) == 0
+
+def test_capture_tolerates_short_gaps_without_inventing_blinks():
+    validate_capture([None, 0, .8, 0] + [0]*20)
+    assert count_blinks([0, .8, None, 0]) == 0
+    with pytest.raises(ValueError, match='No complete blink'):
+        validate_capture([0]*24)
+    with pytest.raises(ValueError, match='Exactly one face'):
+        validate_capture([None]*5 + [0,.8,0] + [0]*24)
+    with pytest.raises(ValueError, match='Exactly one face'):
+        validate_capture([None,0]*12)
 
 def test_report_break_policy():
     session = {'started': '2026-10-08T00:00:00+00:00', 'ended': '2026-10-08T09:00:00+00:00', 'lunch_paid': 0, 'break_paid': 1}
@@ -44,6 +55,19 @@ def test_permissions():
     assert client.get('/api/employees').status_code == 401
     assert client.get('/api/employees',headers=kiosk).status_code == 401
     assert client.get('/api/employees',headers=admin).status_code == 200
+
+def test_admin_session_expiry_and_tampering(monkeypatch):
+    now = main.time.time()
+    response = client.post('/api/admin/session', headers={'Authorization':'Bearer test-admin'})
+    assert response.status_code == 200
+    session = response.json()
+    assert 86399 <= session['expires_at'] - now <= 86400
+    headers = {'Authorization':'Bearer '+session['token']}
+    assert client.get('/api/employees',headers=headers).status_code == 200
+    assert client.get('/api/employees',headers={'Authorization':'Bearer test-admin'}).status_code == 401
+    assert client.get('/api/employees',headers={'Authorization':headers['Authorization']+'x'}).status_code == 401
+    monkeypatch.setattr(main.time,'time',lambda:session['expires_at'])
+    assert client.get('/api/employees',headers=headers).status_code == 401
 
 def test_punch_transitions_replay_and_failed_match(monkeypatch):
     class AWS:

@@ -5,11 +5,16 @@ import os
 import secrets
 import sqlite3
 import time
+import hashlib
+import hmac
+import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+from botocore.exceptions import EndpointConnectionError, ConnectionClosedError, ConnectTimeoutError, ReadTimeoutError, ClientError
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -19,10 +24,13 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
 from app.blink import verify_blinks
+logger = logging.getLogger('uvicorn.error')
 
 load_dotenv()
 DATA = Path(os.getenv('DATA_DIR', 'data'))
 DATA.mkdir(parents=True, exist_ok=True)
+PENDING_DIR = DATA / 'pending-attendance'
+PENDING_DIR.mkdir(parents=True, exist_ok=True)
 DB = DATA / 'attendance.db'
 TZ = ZoneInfo(os.getenv('BUSINESS_TIMEZONE', 'Asia/Manila'))
 app = FastAPI(title='Face DTR API', version='0.1.0')
@@ -94,6 +102,11 @@ with connection() as con:
     CREATE TABLE IF NOT EXISTS challenges (
       id TEXT PRIMARY KEY, employee_id TEXT NOT NULL, action TEXT NOT NULL,
       issued REAL NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS pending_attendance (
+      id TEXT PRIMARY KEY, challenge_id TEXT UNIQUE NOT NULL, action TEXT NOT NULL,
+      captured_at TEXT NOT NULL, photo_name TEXT NOT NULL, reason TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', employee_id TEXT REFERENCES employees(id),
+      reviewed_at TEXT, review_note TEXT, lunch_paid INTEGER NOT NULL, break_paid INTEGER NOT NULL);
     ''')
 
 
@@ -106,7 +119,34 @@ def authorize(value, variable):
 
 
 def admin(authorization: str | None = Header(default=None)):
+    secret = os.getenv('ADMIN_TOKEN', '')
+    if not secret or secret.startswith('replace-'):
+        raise HTTPException(503, 'ADMIN_TOKEN is not configured on the server.')
+    try:
+        token = (authorization or '').removeprefix('Bearer ')
+        payload, signature = token.split('.')
+        expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError('Invalid signature')
+        session = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+        if session['role'] != 'admin' or time.time() >= session['expires_at']:
+            raise ValueError('Expired session')
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(401, 'Administrator session expired or invalid. Sign in again.')
+
+
+def issue_admin_session():
+    expires_at = int(time.time()) + 24 * 60 * 60
+    data = {'role': 'admin', 'expires_at': expires_at, 'nonce': secrets.token_hex(16)}
+    payload = base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip('=')
+    signature = hmac.new(os.environ['ADMIN_TOKEN'].encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return {'token': payload + '.' + signature, 'expires_at': expires_at}
+
+
+@app.post('/api/admin/session')
+def admin_login(authorization: str | None = Header(default=None)):
     authorize(authorization, 'ADMIN_TOKEN')
+    return issue_admin_session()
 
 
 def kiosk(authorization: str | None = Header(default=None)):
@@ -157,6 +197,79 @@ class PunchInput(BaseModel):
     frames: list[str] = Field(min_length=24, max_length=90)
 
 
+class ReviewInput(BaseModel):
+    decision: str = Field(pattern='^(approve|reject)$')
+    employee_id: str | None = Field(default=None, max_length=40)
+    note: str = Field(min_length=1, max_length=500)
+
+
+def unavailable_aws(exc):
+    if isinstance(exc, (EndpointConnectionError, ConnectionClosedError, ConnectTimeoutError, ReadTimeoutError)):
+        return True
+    return isinstance(exc, ClientError) and exc.response.get('ResponseMetadata', {}).get('HTTPStatusCode', 0) >= 500
+
+
+def save_pending(challenge, photo, captured_at):
+    record_id = secrets.token_hex(16)
+    name = record_id + '.jpg'
+    path = PENDING_DIR / name
+    try:
+        with path.open('xb') as file:
+            file.write(photo)
+        with connection() as con:
+            con.execute('INSERT INTO pending_attendance(id,challenge_id,action,captured_at,photo_name,reason,lunch_paid,break_paid) VALUES(?,?,?,?,?,?,?,?)',
+                (record_id, challenge['id'], challenge['action'], captured_at, name, 'AWS connection or service unavailable',
+                 os.getenv('LUNCH_PAID', 'false').lower() == 'true', os.getenv('SHORT_BREAK_PAID', 'true').lower() == 'true'))
+    except (OSError, sqlite3.Error) as exc:
+        path.unlink(missing_ok=True)
+        raise HTTPException(503, 'Could not save the capture on the server. No attendance was recorded; ask an administrator for help.') from exc
+    return {'status': 'pending', 'pending_id': record_id, 'action': challenge['action'], 'at': captured_at,
+            'message': 'Capture saved on the server. Pending administrator verification; attendance is not yet confirmed.'}
+
+
+def record_attendance(con, employee, action, at, score, challenge_id, lunch_paid=None, break_paid=None):
+    """Replay this employee's ordered events to validate historical approvals atomically."""
+    existing = [dict(row) for row in con.execute(
+        'SELECT v.*,s.lunch_paid,s.break_paid FROM events v JOIN sessions s ON s.id=v.session_id '
+        'WHERE v.employee_id=? ORDER BY v.at,v.id', (employee['id'],))]
+    proposed = {'action': action, 'at': at, 'similarity': score, 'challenge_id': challenge_id,
+                'lunch_paid': lunch_paid if lunch_paid is not None else os.getenv('LUNCH_PAID', 'false').lower() == 'true',
+                'break_paid': break_paid if break_paid is not None else os.getenv('SHORT_BREAK_PAID', 'true').lower() == 'true'}
+    timeline = sorted(existing + [proposed], key=lambda event: (event['at'], event.get('id', 2**63)))
+    state = 'off'
+    previous = None
+    for event in timeline:
+        if event['action'] not in ACTIONS[state]:
+            raise HTTPException(409, f"{employee['name']}: {event['action']} at {event['at']} conflicts with attendance state {state}. Review pending captures in time order; no changes were saved.")
+        timestamp = datetime.fromisoformat(event['at'])
+        if previous and (timestamp - previous).total_seconds() < 10:
+            raise HTTPException(409, 'Attendance events must be at least 10 seconds apart. No changes were saved.')
+        previous = timestamp
+        state = NEXT[event['action']]
+    session_id = None
+    # Temporarily close existing open sessions within this transaction so replay
+    # can reopen one session at a time without violating the unique index.
+    con.execute('UPDATE sessions SET ended=COALESCE(ended,started) WHERE employee_id=?', (employee['id'],))
+    for event in timeline:
+        if event['action'] == 'time_in':
+            if 'id' in event:
+                session_id = event['session_id']
+                con.execute("UPDATE sessions SET state='working',ended=NULL WHERE id=?", (session_id,))
+            else:
+                cursor = con.execute('INSERT INTO sessions(employee_id,shift_date,started,state,lunch_paid,break_paid) VALUES(?,?,?,?,?,?)',
+                    (employee['id'], datetime.fromisoformat(at).astimezone(TZ).date().isoformat(), at,
+                     'working', event['lunch_paid'], event['break_paid']))
+                session_id = cursor.lastrowid
+        else:
+            con.execute('UPDATE sessions SET state=?,ended=? WHERE id=?',
+                        (NEXT[event['action']], event['at'] if event['action'] == 'time_out' else None, session_id))
+        if 'id' in event:
+            con.execute('UPDATE events SET session_id=? WHERE id=?', (session_id, event['id']))
+        else:
+            con.execute('INSERT INTO events(session_id,employee_id,action,at,similarity,challenge_id) VALUES(?,?,?,?,?,?)',
+                        (session_id, employee['id'], action, at, score, challenge_id))
+
+
 @app.get('/api/health')
 def health():
     return {'status': 'ok', 'timezone': str(TZ),
@@ -180,7 +293,7 @@ def kiosk_access():
 def latest_punch():
     with connection() as con:
         row = con.execute('SELECT e.name AS employee,e.department,v.action,v.at '
-                          'FROM events v JOIN employees e ON e.id=v.employee_id ORDER BY v.id DESC LIMIT 1').fetchone()
+                          'FROM events v JOIN employees e ON e.id=v.employee_id ORDER BY v.at DESC,v.id DESC LIMIT 1').fetchone()
         return dict(row) if row else None
 
 
@@ -234,6 +347,7 @@ def challenge(data: ChallengeInput):
 
 @app.post('/api/punches', dependencies=[Depends(kiosk)])
 def punch(data: PunchInput):
+    captured_at = datetime.now(timezone.utc).isoformat()
     if sum(map(len, data.frames)) > 12_000_000:
         raise HTTPException(413, 'Capture too large.')
     with connection() as con:
@@ -248,8 +362,11 @@ def punch(data: PunchInput):
     if not candidates:
         raise HTTPException(404, 'No enrolled employees are available.')
     try:
+        blink_started = time.perf_counter()
         reference = verify_blinks([decode_image(frame) for frame in data.frames])
+        logger.info('capture_blink action=%s frames=%d duration_ms=%.0f', c['action'], len(data.frames), (time.perf_counter() - blink_started) * 1000)
     except ValueError as exc:
+        logger.warning('capture_rejected action=%s stage=blink reason=%s', c['action'], str(exc))
         raise HTTPException(422, str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
@@ -258,44 +375,80 @@ def punch(data: PunchInput):
     threshold = float(os.getenv('FACE_THRESHOLD', '99'))
     target = jpeg(reference)
     try:
+        aws_started = time.perf_counter()
         aws = aws_client()
         def compare(employee):
             result = aws.compare_faces(SourceImage={'Bytes': employee['face']},
                     TargetImage={'Bytes': target}, SimilarityThreshold=threshold, QualityFilter='AUTO')
             scores = [m['Similarity'] for m in result.get('FaceMatches', []) if m['Similarity'] >= threshold]
             return (employee, max(scores)) if scores else None
-        with ThreadPoolExecutor(max_workers=min(4, len(candidates))) as pool:
-            matches = [m for m in pool.map(compare, candidates) if m is not None]
+        # Probe one comparison first so a total outage does not launch a slow
+        # failed request for every enrolled employee before queuing the capture.
+        first = compare(candidates[0])
+        matches = [first] if first else []
+        if len(candidates) > 1:
+            with ThreadPoolExecutor(max_workers=min(4, len(candidates) - 1)) as pool:
+                matches.extend(m for m in pool.map(compare, candidates[1:]) if m is not None)
+        logger.info('capture_matching action=%s candidates=%d matches=%d duration_ms=%.0f',
+                    c['action'], len(candidates), len(matches), (time.perf_counter() - aws_started) * 1000)
     except Exception as exc:
-        raise HTTPException(503, 'AWS verification unavailable. No attendance was recorded.') from exc
+        if unavailable_aws(exc):
+            return save_pending(c, target, captured_at)
+        raise HTTPException(503, 'AWS verification unavailable. Check credentials and permissions. No capture was queued or attendance recorded.') from exc
     if not matches:
         raise HTTPException(403, 'Face was not recognized. No attendance was recorded.')
     if len(matches) != 1:
         raise HTTPException(403, 'Face matched multiple employees. Ask an administrator to review enrollment photos. No attendance was recorded.')
     employee, score = matches[0]
-    now = datetime.now(timezone.utc)
-    at = now.isoformat()
+    at = captured_at
     with connection() as con:
         con.execute('BEGIN IMMEDIATE')
-        session = con.execute('SELECT * FROM sessions WHERE employee_id=? AND ended IS NULL', (employee['id'],)).fetchone()
-        state = session['state'] if session else 'off'
-        if c['action'] not in ACTIONS[state]:
-            raise HTTPException(409, f"{employee['name']} is currently {state}. Choose a valid attendance action. No attendance was recorded.")
-        recent = con.execute('SELECT at FROM events WHERE employee_id=? ORDER BY id DESC LIMIT 1', (employee['id'],)).fetchone()
-        if recent and (now - datetime.fromisoformat(recent['at'])).total_seconds() < 10:
-            raise HTTPException(409, 'A punch was just recorded. Wait before the next action.')
-        if c['action'] == 'time_in':
-            cursor = con.execute('INSERT INTO sessions(employee_id,shift_date,started,state,lunch_paid,break_paid) VALUES(?,?,?,?,?,?)',
-                (employee['id'], now.astimezone(TZ).date().isoformat(), at, 'working',
-                 os.getenv('LUNCH_PAID', 'false').lower() == 'true', os.getenv('SHORT_BREAK_PAID', 'true').lower() == 'true'))
-            session_id = cursor.lastrowid
-        else:
-            session_id = session['id']
-            con.execute('UPDATE sessions SET state=?, ended=? WHERE id=?',
-                        (NEXT[c['action']], at if c['action'] == 'time_out' else None, session_id))
-        con.execute('INSERT INTO events(session_id,employee_id,action,at,similarity,challenge_id) VALUES(?,?,?,?,?,?)',
-                    (session_id, employee['id'], c['action'], at, score, c['id']))
-    return {'employee': employee['name'], 'department': employee['department'], 'action': c['action'], 'at': at, 'similarity': round(score, 2)}
+        record_attendance(con, employee, c['action'], at, score, c['id'])
+    return {'status': 'confirmed', 'employee': employee['name'], 'department': employee['department'], 'action': c['action'], 'at': at, 'similarity': round(score, 2)}
+
+
+@app.get('/api/pending-attendance', dependencies=[Depends(admin)])
+def pending_records():
+    with connection() as con:
+        return [dict(row) for row in con.execute(
+            'SELECT p.id,p.action,p.captured_at,p.reason,p.status,p.employee_id,p.reviewed_at,p.review_note,e.name AS employee '
+            'FROM pending_attendance p LEFT JOIN employees e ON e.id=p.employee_id '
+            "ORDER BY CASE WHEN p.status='pending' THEN 0 ELSE 1 END,p.captured_at LIMIT 500")]
+
+
+@app.get('/api/pending-attendance/{record_id}/photo', dependencies=[Depends(admin)])
+def pending_photo(record_id: str):
+    with connection() as con:
+        row = con.execute('SELECT photo_name FROM pending_attendance WHERE id=?', (record_id,)).fetchone()
+    if not row or not (PENDING_DIR / row['photo_name']).is_file():
+        raise HTTPException(404, 'Capture photo unavailable.')
+    return FileResponse(PENDING_DIR / row['photo_name'], media_type='image/jpeg',
+                        headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
+
+
+@app.post('/api/pending-attendance/{record_id}/review', dependencies=[Depends(admin)])
+def review_pending(record_id: str, data: ReviewInput):
+    if not data.note.strip():
+        raise HTTPException(400, 'A review reason is required.')
+    with connection() as con:
+        con.execute('BEGIN IMMEDIATE')
+        row = con.execute('SELECT * FROM pending_attendance WHERE id=?', (record_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, 'Pending record not found.')
+        if row['status'] != 'pending':
+            raise HTTPException(409, 'This capture has already been reviewed.')
+        employee = None
+        if data.decision == 'approve':
+            if not (PENDING_DIR / row['photo_name']).is_file():
+                raise HTTPException(409, 'Capture photo is missing. Restore it before approving attendance.')
+            employee = con.execute('SELECT * FROM employees WHERE id=? AND active=1', (data.employee_id,)).fetchone()
+            if not employee:
+                raise HTTPException(400, 'Select an active enrolled employee before approving.')
+            record_attendance(con, employee, row['action'], row['captured_at'], 0, row['challenge_id'], row['lunch_paid'], row['break_paid'])
+        con.execute('UPDATE pending_attendance SET status=?,employee_id=?,reviewed_at=?,review_note=? WHERE id=?',
+                    ('approved' if employee else 'rejected', employee['id'] if employee else None,
+                     datetime.now(timezone.utc).isoformat(), data.note.strip(), record_id))
+    return {'status': 'approved' if employee else 'rejected', 'id': record_id}
 
 
 def summarize(session, events, now=None):
@@ -329,7 +482,7 @@ def records(date: str | None = None):
         rows = con.execute('SELECT s.*,e.name FROM sessions s JOIN employees e ON e.id=s.employee_id '
                            + ('WHERE shift_date=? ' if date else '') + 'ORDER BY s.id DESC LIMIT 1000',
                            (date,) if date else ()).fetchall()
-        return [summarize(s, con.execute('SELECT action,at,similarity FROM events WHERE session_id=? ORDER BY id', (s['id'],)).fetchall()) for s in rows]
+        return [summarize(s, con.execute('SELECT action,at,similarity FROM events WHERE session_id=? ORDER BY at,id', (s['id'],)).fetchall()) for s in rows]
 
 
 @app.get('/api/records.csv', dependencies=[Depends(admin)])
